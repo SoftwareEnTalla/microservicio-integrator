@@ -5,9 +5,6 @@ services:
       - "${PORT:-3000}:${PORT:-3000}"
     env_file:
       - .env
-    depends_on:
-      postgres:
-        condition: service_healthy
     networks:
       entalla-net: {}
       shared-net:
@@ -45,6 +42,3 @@ networks:
     driver: bridge
   shared-net:
     external: true
-
-volumes:
-  pgdata:
