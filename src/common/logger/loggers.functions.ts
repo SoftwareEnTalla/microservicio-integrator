@@ -40,6 +40,72 @@ export function getRemoteApiLoggerUrl(): string {
     : "/command";
   return createUrl;
 }
+
+function getTraceSourceService(): string {
+  const appName = (process.env.APP_NAME || "").trim();
+  if (appName) {
+    const normalizedAppName = appName
+      .replace(/app$/i, "")
+      .replace(/[^a-z0-9]/gi, "")
+      .toLowerCase();
+    if (normalizedAppName) {
+      return `${normalizedAppName}-service`;
+    }
+  }
+
+  const serviceName = (process.env.SERVICE_NAME || "").trim().toLowerCase();
+  return serviceName || "unknown-service";
+}
+
+function normalizeLayerType(layer: string): string {
+  const normalized = layer
+    .trim()
+    .replace(/[^a-z0-9]+/gi, "_")
+    .replace(/^_+|_+$/g, "")
+    .toUpperCase();
+  return normalized || "SERVICE";
+}
+
+function inferFunctionalKind(sourceService: string, targetName: string, propertyKey: string, layerType: string, explicitKind?: string): string {
+  const normalizedKind = (explicitKind || "").trim().toUpperCase();
+  if (normalizedKind) {
+    return normalizedKind;
+  }
+
+  const text = `${sourceService} ${targetName} ${propertyKey} ${layerType}`.toLowerCase();
+  if (/(auth|security|guard|acl|rbac|mfa)/.test(text)) return "SECURITY";
+  if (/(event|consumer|producer|integration|webhook|gateway)/.test(text)) return "INTEGRATION";
+  if (/(audit|trace|history|compliance)/.test(text)) return "AUDIT";
+  if (/(order|invoice|merchant|customer|payment|product|crm|organization|catalog|salesmanager)/.test(text)) return "BUSINESS";
+  return "TECHNICAL";
+}
+
+function resolveSeverity(status: "success" | "error", explicitSeverity?: string): string {
+  const normalizedSeverity = (explicitSeverity || "").trim().toUpperCase();
+  if (normalizedSeverity) {
+    return normalizedSeverity;
+  }
+  return status === "error" ? "ERROR" : "INFO";
+}
+
+function buildTraceDescription(
+  sourceService: string,
+  functionName: string,
+  severity: string,
+  functionalKind: string,
+  layerType: string,
+  status: "success" | "error",
+  explicitDescription?: string,
+  errorMessage?: string,
+): string {
+  if (explicitDescription?.trim()) {
+    return explicitDescription.trim();
+  }
+
+  const outcome = status === "error" ? "falló" : "completó";
+  const suffix = errorMessage ? ` Error: ${errorMessage}` : "";
+  return `${severity} ${functionalKind} ${layerType}: ${sourceService} -> ${functionName} ${outcome}.${suffix}`.trim();
+}
 export function LogExecutionTime(options: LogExecutionTimeOptions) {
   return function (
     target: any,
@@ -61,11 +127,17 @@ export function LogExecutionTime(options: LogExecutionTimeOptions) {
 
       const {
         layer = "default",
+        severity,
+        functionalKind,
+        description,
         refuuid,
         timeFormat = "ms",
         client, // ILoggerClient obligatorio
         callback, // Opcional
       } = options;
+      const sourceService = getTraceSourceService();
+      const layerType = normalizeLayerType(layer);
+      const resolvedFunctionalKind = inferFunctionalKind(sourceService, target.constructor.name, propertyKey, layerType, functionalKind);
 
       logger.log(
         `[${layer}] [${target.constructor.name}.${propertyKey}] [${uuid}] Inicio ejecución` // Incluye el nombre de la clase
@@ -87,6 +159,11 @@ export function LogExecutionTime(options: LogExecutionTimeOptions) {
           method: "POST",
           body: {
             layer,
+            layerType,
+            severity: resolveSeverity("success", severity),
+            functionalKind: resolvedFunctionalKind,
+            description: buildTraceDescription(sourceService, `${target.constructor.name}.${propertyKey}`, resolveSeverity("success", severity), resolvedFunctionalKind, layerType, "success", description),
+            sourceService,
             uuid,
             refuuid,
             className: target.constructor.name,
@@ -119,6 +196,11 @@ export function LogExecutionTime(options: LogExecutionTimeOptions) {
           method: "POST",
           body: {
             layer,
+            layerType,
+            severity: resolveSeverity("error", severity),
+            functionalKind: resolvedFunctionalKind,
+            description: buildTraceDescription(sourceService, `${target.constructor.name}.${propertyKey}`, resolveSeverity("error", severity), resolvedFunctionalKind, layerType, "error", description, error.message),
+            sourceService,
             uuid,
             refuuid,
             className: target.constructor.name,

@@ -29,9 +29,11 @@
  */
 
 
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Saga, CommandBus, EventBus, ofType } from '@nestjs/cqrs';
 import { Observable, map, tap } from 'rxjs';
+import { InjectDataSource } from '@nestjs/typeorm';
+import { DataSource } from 'typeorm';
 import {
   IntegrationCredentialCreatedEvent,
   IntegrationCredentialUpdatedEvent,
@@ -51,6 +53,7 @@ import {
 import { LogExecutionTime } from 'src/common/logger/loggers.functions';
 import { LoggerClient } from 'src/common/logger/logger.client';
 import { logger } from '@core/logs/logger';
+import { IntegrationStatus } from '../../integration-status/entities/integration-status.entity';
 
 @Injectable()
 export class IntegrationCredentialCrudSaga {
@@ -58,7 +61,8 @@ export class IntegrationCredentialCrudSaga {
 
   constructor(
     private readonly commandBus: CommandBus,
-    private readonly eventBus: EventBus
+    private readonly eventBus: EventBus,
+    @Optional() @InjectDataSource() private readonly dataSource: DataSource | undefined,
   ) {}
 
   // Reacción a evento de creación
@@ -118,6 +122,7 @@ export class IntegrationCredentialCrudSaga {
   })
   private async handleIntegrationCredentialCreated(event: IntegrationCredentialCreatedEvent): Promise<void> {
     try {
+      await this.upsertOperationalStatus(event, false);
       this.logger.log(`Saga IntegrationCredential Created completada: ${event.aggregateId}`);
       // Lógica post-creación (ej: enviar notificación, ejecutar comandos adicionales)
     } catch (error: any) {
@@ -142,6 +147,7 @@ export class IntegrationCredentialCrudSaga {
   })
   private async handleIntegrationCredentialUpdated(event: IntegrationCredentialUpdatedEvent): Promise<void> {
     try {
+      await this.upsertOperationalStatus(event, false);
       this.logger.log(`Saga IntegrationCredential Updated completada: ${event.aggregateId}`);
       // Lógica post-actualización (ej: actualizar caché)
     } catch (error: any) {
@@ -166,6 +172,7 @@ export class IntegrationCredentialCrudSaga {
   })
   private async handleIntegrationCredentialDeleted(event: IntegrationCredentialDeletedEvent): Promise<void> {
     try {
+      await this.upsertOperationalStatus(event, true);
       this.logger.log(`Saga IntegrationCredential Deleted completada: ${event.aggregateId}`);
       // Lógica post-eliminación (ej: limpiar relaciones)
     } catch (error: any) {
@@ -177,5 +184,117 @@ export class IntegrationCredentialCrudSaga {
   private handleSagaError(error: Error, event: any) {
     this.logger.error(`Error en saga para evento ${event.constructor.name}: ${error.message}`);
     this.eventBus.publish(new SagaIntegrationCredentialFailedEvent( error,event));
+  }
+
+  private async upsertOperationalStatus(
+    event: IntegrationCredentialCreatedEvent | IntegrationCredentialUpdatedEvent | IntegrationCredentialDeletedEvent,
+    deleted: boolean,
+  ): Promise<void> {
+    const dataSource = this.resolveDataSource();
+    if (!dataSource) {
+      this.logger.warn(`Saga IntegrationCredential sin DataSource para sincronizar IntegrationStatus de ${event.aggregateId}`);
+      return;
+    }
+
+    const snapshot = this.extractSnapshot(event);
+    const derived = this.deriveCredentialHealth(snapshot, deleted);
+    const repository = dataSource.getRepository(IntegrationStatus);
+    const code = this.buildStatusCode(event.aggregateId);
+    const existing = await repository.findOne({ where: { code } as any });
+
+    await repository.save(
+      repository.create({
+        ...(existing as any || {}),
+        name: `Integration credential ${String(snapshot?.alias || snapshot?.name || event.aggregateId).slice(0, 80)}`,
+        description: `Estado operativo derivado por saga para la credencial ${event.aggregateId}: ${derived.displayName}.`,
+        code,
+        displayName: derived.displayName,
+        isTerminal: derived.isTerminal,
+        isOperational: derived.isOperational,
+        severity: derived.severity,
+        createdBy: (event as any)?.payload?.metadata?.initiatedBy || 'system',
+        isActive: true,
+      } as any),
+    );
+  }
+
+  private extractSnapshot(
+    event: IntegrationCredentialCreatedEvent | IntegrationCredentialUpdatedEvent | IntegrationCredentialDeletedEvent,
+  ): Record<string, any> {
+    return (event as any)?.payload?.instance || {};
+  }
+
+  private deriveCredentialHealth(snapshot: Record<string, any>, deleted: boolean): {
+    displayName: string;
+    isOperational: boolean;
+    isTerminal: boolean;
+    severity: string;
+  } {
+    const rawStatus = String(snapshot?.status || '').toUpperCase();
+    const hasSecretMaterial = [snapshot?.apiKey, snapshot?.clientSecret, snapshot?.accessToken, snapshot?.webhookSecret]
+      .some((value) => typeof value === 'string' && value.trim().length > 0);
+    const expiresAt = snapshot?.expiresAt ? new Date(snapshot.expiresAt) : null;
+    const isExpired = Boolean(expiresAt && !Number.isNaN(expiresAt.getTime()) && expiresAt.getTime() < Date.now());
+
+    if (deleted) {
+      return {
+        displayName: 'DELETED',
+        isOperational: false,
+        isTerminal: true,
+        severity: 'INFO',
+      };
+    }
+    if (rawStatus === 'ACTIVE' && hasSecretMaterial && !isExpired) {
+      return {
+        displayName: 'ACTIVE_OPERATIONAL',
+        isOperational: true,
+        isTerminal: false,
+        severity: 'INFO',
+      };
+    }
+    if (rawStatus === 'ACTIVE' && (!hasSecretMaterial || isExpired)) {
+      return {
+        displayName: 'ACTIVE_DEGRADED',
+        isOperational: false,
+        isTerminal: false,
+        severity: 'HIGH',
+      };
+    }
+    if (isExpired || rawStatus === 'EXPIRED') {
+      return {
+        displayName: 'EXPIRED',
+        isOperational: false,
+        isTerminal: true,
+        severity: 'HIGH',
+      };
+    }
+    if (['DISABLED', 'INACTIVE', 'REVOKED'].includes(rawStatus)) {
+      return {
+        displayName: rawStatus,
+        isOperational: false,
+        isTerminal: false,
+        severity: 'MEDIUM',
+      };
+    }
+
+    return {
+      displayName: 'PENDING_CONFIGURATION',
+      isOperational: false,
+      isTerminal: false,
+      severity: 'MEDIUM',
+    };
+  }
+
+  private buildStatusCode(aggregateId: string): string {
+    const compactId = String(aggregateId || '').replace(/-/g, '');
+    return `CRED_${compactId.slice(0, 12)}_${compactId.slice(-12)}`;
+  }
+
+  private resolveDataSource(): DataSource | null {
+    if (this.dataSource?.isInitialized) {
+      return this.dataSource;
+    }
+
+    return null;
   }
 }
